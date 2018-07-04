@@ -1,2 +1,2 @@
-# EOS ADD Date Side Chain WIP
+# EOS ADD Data Side Chain WIP
 
