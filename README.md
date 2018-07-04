@@ -1,2 +1,2 @@
-# EOS ADD Data Side Chain WIP
+# EOS ADD Dataside Chain WIP
 
