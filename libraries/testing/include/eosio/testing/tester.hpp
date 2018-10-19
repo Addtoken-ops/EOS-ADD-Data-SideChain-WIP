@@ -6,6 +6,7 @@
 #include <eosio/chain/abi_serializer.hpp>
 #include <fc/io/json.hpp>
 #include <boost/test/unit_test.hpp>
+#include <boost/tuple/tuple_io.hpp>
 
 #include <iosfwd>
 
@@ -55,7 +56,9 @@ namespace boost { namespace test_tools { namespace tt_detail {
 } } }
 
 namespace eosio { namespace testing {
-
+   std::vector<uint8_t> read_wasm( const char* fn );
+   std::vector<char>    read_abi( const char* fn );
+   std::string          read_wast( const char* fn );
    using namespace eosio::chain;
 
    fc::variant_object filter_fields(const fc::variant_object& filter, const fc::variant_object& value);
@@ -75,14 +78,15 @@ namespace eosio { namespace testing {
          static const uint32_t DEFAULT_EXPIRATION_DELTA = 6;
 
          static const uint32_t DEFAULT_BILLED_CPU_TIME_US = 2000;
+         static const fc::microseconds abi_serializer_max_time;
 
          virtual ~base_tester() {};
 
-         void              init(bool push_genesis = true);
-         void              init(controller::config config);
+         void              init(bool push_genesis = true, db_read_mode read_mode = db_read_mode::SPECULATIVE);
+         void              init(controller::config config, const snapshot_reader_ptr& snapshot = nullptr);
 
          void              close();
-         void              open();
+         void              open( const snapshot_reader_ptr& snapshot );
          bool              is_same_chain( base_tester& other );
 
          virtual signed_block_ptr produce_block( fc::microseconds skip_time = fc::milliseconds(config::block_interval_ms), uint32_t skip_flag = 0/*skip_missed_block_penalty*/ ) = 0;
@@ -121,9 +125,9 @@ namespace eosio { namespace testing {
          action get_action( account_name code, action_name acttype, vector<permission_level> auths,
                                          const variant_object& data )const;
 
-         void                 set_transaction_headers(signed_transaction& trx,
-                                                      uint32_t expiration = DEFAULT_EXPIRATION_DELTA,
-                                                      uint32_t delay_sec = 0)const;
+         void  set_transaction_headers( transaction& trx,
+                                        uint32_t expiration = DEFAULT_EXPIRATION_DELTA,
+                                        uint32_t delay_sec = 0 )const;
 
          vector<transaction_trace_ptr>  create_accounts( vector<account_name> names,
                                                          bool multisig = false,
@@ -199,7 +203,7 @@ namespace eosio { namespace testing {
                                                              const symbol&       asset_symbol,
                                                              const account_name& account ) const;
 
-         vector<char> get_row_by_account( uint64_t code, uint64_t scope, uint64_t table, const account_name& act );
+         vector<char> get_row_by_account( uint64_t code, uint64_t scope, uint64_t table, const account_name& act ) const;
 
          map<account_name, block_id_type> get_last_produced_block_map()const { return last_produced_block; };
          void set_last_produced_block_map( const map<account_name, block_id_type>& lpb ) { last_produced_block = lpb; }
@@ -226,7 +230,7 @@ namespace eosio { namespace testing {
                   const auto& accnt = control->db().get<account_object, by_name>( name );
                   abi_def abi;
                   if( abi_serializer::to_abi( accnt.abi, abi )) {
-                     return abi_serializer( abi );
+                     return abi_serializer( abi, abi_serializer_max_time );
                   }
                   return optional<abi_serializer>();
                } FC_RETHROW_EXCEPTIONS( error, "Failed to find or parse ABI for ${name}", ("name", name))
@@ -260,6 +264,10 @@ namespace eosio { namespace testing {
             return true;
          }
 
+         const controller::config& get_config() const {
+            return cfg;
+         }
+
       protected:
          signed_block_ptr _produce_block( fc::microseconds skip_time, bool skip_pending_trxs = false, uint32_t skip_flag = 0 );
          void             _start_block(fc::time_point block_time);
@@ -279,11 +287,8 @@ namespace eosio { namespace testing {
 
    class tester : public base_tester {
    public:
-      tester(bool push_genesis) {
-         init(push_genesis);
-      }
-      tester() {
-         init(true);
+      tester(bool push_genesis = true, db_read_mode read_mode = db_read_mode::SPECULATIVE ) {
+         init(push_genesis, read_mode);
       }
 
       tester(controller::config config) {
@@ -308,32 +313,44 @@ namespace eosio { namespace testing {
          try {
             if( num_blocks_to_producer_before_shutdown > 0 )
                produce_blocks( num_blocks_to_producer_before_shutdown );
-            BOOST_REQUIRE_EQUAL( validate(), true );
+            if (!skip_validate)
+               BOOST_REQUIRE_EQUAL( validate(), true );
          } catch( const fc::exception& e ) {
             wdump((e.to_detail_string()));
          }
       }
       controller::config vcfg;
 
-      validating_tester() {
+      static controller::config default_config() {
+         fc::temp_directory tempdir;
+         controller::config vcfg;
          vcfg.blocks_dir      = tempdir.path() / std::string("v_").append(config::default_blocks_dir_name);
          vcfg.state_dir  = tempdir.path() /  std::string("v_").append(config::default_state_dir_name);
          vcfg.state_size = 1024*1024*8;
+         vcfg.state_guard_size = 0;
          vcfg.reversible_cache_size = 1024*1024*8;
+         vcfg.reversible_guard_size = 0;
          vcfg.contracts_console = false;
 
          vcfg.genesis.initial_timestamp = fc::time_point::from_iso_string("2020-01-01T00:00:00.000");
          vcfg.genesis.initial_key = get_public_key( config::system_account_name, "active" );
 
          for(int i = 0; i < boost::unit_test::framework::master_test_suite().argc; ++i) {
-            if(boost::unit_test::framework::master_test_suite().argv[i] == std::string("--binaryen"))
-               vcfg.wasm_runtime = chain::wasm_interface::vm_type::binaryen;
-            else if(boost::unit_test::framework::master_test_suite().argv[i] == std::string("--wavm"))
+            if(boost::unit_test::framework::master_test_suite().argv[i] == std::string("--wavm"))
                vcfg.wasm_runtime = chain::wasm_interface::vm_type::wavm;
+            else if(boost::unit_test::framework::master_test_suite().argv[i] == std::string("--wabt"))
+               vcfg.wasm_runtime = chain::wasm_interface::vm_type::wabt;
          }
+         return vcfg;
+      }
 
+      validating_tester(const flat_set<account_name>& trusted_producers = flat_set<account_name>()) {
+         vcfg = default_config();
+
+         vcfg.trusted_producers = trusted_producers;
 
          validating_node = std::make_unique<controller>(vcfg);
+         validating_node->add_indices();
          validating_node->startup();
 
          init(true);
@@ -348,6 +365,7 @@ namespace eosio { namespace testing {
          vcfg.state_dir  = vcfg.state_dir.parent_path() / std::string("v_").append( vcfg.state_dir.filename().generic_string() );
 
          validating_node = std::make_unique<controller>(vcfg);
+         validating_node->add_indices();
          validating_node->startup();
 
          init(config);
@@ -358,6 +376,14 @@ namespace eosio { namespace testing {
          validating_node->push_block( sb );
 
          return sb;
+      }
+
+      signed_block_ptr produce_block_no_validation( fc::microseconds skip_time = fc::milliseconds(config::block_interval_ms), uint32_t skip_flag = 0 /*skip_missed_block_penalty*/ ) {
+         return _produce_block(skip_time, false, skip_flag | 2);
+      }
+
+      void validate_push_block(const signed_block_ptr& sb) {
+         validating_node->push_block( sb );
       }
 
       signed_block_ptr produce_empty_block( fc::microseconds skip_time = fc::milliseconds(config::block_interval_ms), uint32_t skip_flag = 0 /*skip_missed_block_penalty*/ )override {
@@ -384,6 +410,7 @@ namespace eosio { namespace testing {
 
         validating_node.reset();
         validating_node = std::make_unique<controller>(vcfg);
+        validating_node->add_indices();
         validating_node->startup();
 
         return ok;
@@ -391,6 +418,7 @@ namespace eosio { namespace testing {
 
       unique_ptr<controller>   validating_node;
       uint32_t                 num_blocks_to_producer_before_shutdown = 0;
+      bool                     skip_validate = false;
    };
 
    /**

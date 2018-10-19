@@ -98,7 +98,7 @@ namespace eosio { namespace chain { namespace resource_limits {
             EOS_ASSERT(std::numeric_limits<decltype(value_ex)>::max() - value_ex >= value_ex_contrib, rate_limiting_state_inconsistent, "Overflow in accumulated value when adding usage!");
 
             if( last_ordinal != ordinal ) {
-               FC_ASSERT( ordinal > last_ordinal, "new ordinal cannot be less than the previous ordinal" );
+               EOS_ASSERT( ordinal > last_ordinal, resource_limit_exception, "new ordinal cannot be less than the previous ordinal" );
                if( (uint64_t)last_ordinal + window_size > (uint64_t)ordinal ) {
                   const auto delta = ordinal - last_ordinal; // clearly 0 < delta < window_size
                   const auto decay = make_ratio(
@@ -264,3 +264,10 @@ CHAINBASE_SET_INDEX_TYPE(eosio::chain::resource_limits::resource_limits_object, 
 CHAINBASE_SET_INDEX_TYPE(eosio::chain::resource_limits::resource_usage_object,         eosio::chain::resource_limits::resource_usage_index)
 CHAINBASE_SET_INDEX_TYPE(eosio::chain::resource_limits::resource_limits_config_object, eosio::chain::resource_limits::resource_limits_config_index)
 CHAINBASE_SET_INDEX_TYPE(eosio::chain::resource_limits::resource_limits_state_object,  eosio::chain::resource_limits::resource_limits_state_index)
+
+FC_REFLECT(eosio::chain::resource_limits::usage_accumulator, (last_ordinal)(value_ex)(consumed))
+
+FC_REFLECT(eosio::chain::resource_limits::resource_limits_object, (owner)(net_weight)(cpu_weight)(ram_bytes))
+FC_REFLECT(eosio::chain::resource_limits::resource_usage_object,  (owner)(net_usage)(cpu_usage)(ram_usage))
+FC_REFLECT(eosio::chain::resource_limits::resource_limits_config_object, (cpu_limit_parameters)(net_limit_parameters)(account_cpu_usage_average_window)(account_net_usage_average_window))
+FC_REFLECT(eosio::chain::resource_limits::resource_limits_state_object, (average_block_net_usage)(average_block_cpu_usage)(pending_net_usage)(pending_cpu_usage)(total_net_weight)(total_cpu_weight)(total_ram_bytes)(virtual_net_limit)(virtual_cpu_limit))

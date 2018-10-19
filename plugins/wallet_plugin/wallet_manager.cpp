@@ -4,6 +4,7 @@
  */
 #include <eosio/wallet_plugin/wallet_manager.hpp>
 #include <eosio/wallet_plugin/wallet.hpp>
+#include <eosio/wallet_plugin/se_wallet.hpp>
 #include <eosio/chain/exceptions.hpp>
 #include <boost/algorithm/string.hpp>
 namespace eosio {
@@ -24,9 +25,26 @@ bool valid_filename(const string& name) {
    return boost::filesystem::path(name).filename().string() == name;
 }
 
+wallet_manager::wallet_manager() {
+#ifdef __APPLE__
+   try {
+      wallets.emplace("SecureEnclave", std::make_unique<se_wallet>());
+   } catch(fc::exception& ) {}
+#endif
+}
+
+wallet_manager::~wallet_manager() {
+   //not really required, but may spook users
+   if(wallet_dir_lock)
+      boost::filesystem::remove(lock_path);
+}
+
 void wallet_manager::set_timeout(const std::chrono::seconds& t) {
    timeout = t;
-   timeout_time = std::chrono::system_clock::now() + timeout;
+   auto now = std::chrono::system_clock::now();
+   timeout_time = now + timeout;
+   EOS_ASSERT(timeout_time >= now && timeout_time.time_since_epoch().count() > 0, invalid_lock_timeout_exception, "Overflow on timeout_time, specified ${t}, now ${now}, timeout_time ${timeout_time}",
+             ("t", t.count())("now", now.time_since_epoch().count())("timeout_time", timeout_time.time_since_epoch().count()));
 }
 
 void wallet_manager::check_timeout() {
@@ -251,6 +269,26 @@ wallet_manager::sign_digest(const chain::digest_type& digest, const public_key_t
    EOS_THROW(chain::wallet_missing_pub_key_exception, "Public key not found in unlocked wallets ${k}", ("k", key));
 }
 
+void wallet_manager::own_and_use_wallet(const string& name, std::unique_ptr<wallet_api>&& wallet) {
+   if(wallets.find(name) != wallets.end())
+      FC_THROW("tried to use wallet name the already existed");
+   wallets.emplace(name, std::move(wallet));
+}
+
+void wallet_manager::initialize_lock() {
+   //This is technically somewhat racy in here -- if multiple keosd are in this function at once.
+   //I've considered that an acceptable tradeoff to maintain cross-platform boost constructs here
+   lock_path = dir / "wallet.lock";
+   {
+      std::ofstream x(lock_path.string());
+      EOS_ASSERT(!x.fail(), wallet_exception, "Failed to open wallet lock file at ${f}", ("f", lock_path.string()));
+   }
+   wallet_dir_lock = std::make_unique<boost::interprocess::file_lock>(lock_path.string().c_str());
+   if(!wallet_dir_lock->try_lock()) {
+      wallet_dir_lock.reset();
+      EOS_THROW(wallet_exception, "Failed to lock access to wallet directory; is another keosd running?");
+   }
+}
 
 } // namespace wallet
 } // namespace eosio

@@ -92,7 +92,7 @@ void apply_eosio_newaccount(apply_context& context) {
    }
 
    auto existing_account = db.find<account_object, by_name>(create.name);
-   EOS_ASSERT(existing_account == nullptr, action_validate_exception,
+   EOS_ASSERT(existing_account == nullptr, account_name_exists_exception,
               "Cannot create account named ${name}, as that name is already taken",
               ("name", create.name));
 
@@ -121,7 +121,7 @@ void apply_eosio_newaccount(apply_context& context) {
    ram_delta += owner_permission.auth.get_billable_size();
    ram_delta += active_permission.auth.get_billable_size();
 
-   context.trx_context.add_ram_usage(create.name, ram_delta);
+   context.add_ram_usage(create.name, ram_delta);
 
 } FC_CAPTURE_AND_RETHROW( (create) ) }
 
@@ -132,8 +132,8 @@ void apply_eosio_setcode(apply_context& context) {
    auto  act = context.act.data_as<setcode>();
    context.require_authorization(act.account);
 
-   FC_ASSERT( act.vmtype == 0 );
-   FC_ASSERT( act.vmversion == 0 );
+   EOS_ASSERT( act.vmtype == 0, invalid_contract_vm_type, "code should be 0" );
+   EOS_ASSERT( act.vmversion == 0, invalid_contract_vm_version, "version should be 0" );
 
    fc::sha256 code_id; /// default ID == 0
 
@@ -148,7 +148,7 @@ void apply_eosio_setcode(apply_context& context) {
    int64_t old_size  = (int64_t)account.code.size() * config::setcode_ram_bytes_multiplier;
    int64_t new_size  = code_size * config::setcode_ram_bytes_multiplier;
 
-   FC_ASSERT( account.code_version != code_id, "contract is already running this version of code" );
+   EOS_ASSERT( account.code_version != code_id, set_exact_code, "contract is already running this version of code" );
 
    db.modify( account, [&]( auto& a ) {
       /** TODO: consider whether a microsecond level local timestamp is sufficient to detect code version changes*/
@@ -167,7 +167,7 @@ void apply_eosio_setcode(apply_context& context) {
    });
 
    if (new_size != old_size) {
-      context.trx_context.add_ram_usage( act.account, new_size - old_size );
+      context.add_ram_usage( act.account, new_size - old_size );
    }
 }
 
@@ -196,7 +196,7 @@ void apply_eosio_setabi(apply_context& context) {
    });
 
    if (new_size != old_size) {
-      context.trx_context.add_ram_usage( act.account, new_size - old_size );
+      context.add_ram_usage( act.account, new_size - old_size );
    }
 }
 
@@ -254,13 +254,13 @@ void apply_eosio_updateauth(apply_context& context) {
 
       int64_t new_size = (int64_t)(config::billable_size_v<permission_object> + permission->auth.get_billable_size());
 
-      context.trx_context.add_ram_usage( permission->owner, new_size - old_size );
+      context.add_ram_usage( permission->owner, new_size - old_size );
    } else {
       const auto& p = authorization.create_permission( update.account, update.permission, parent_id, update.auth );
 
       int64_t new_size = (int64_t)(config::billable_size_v<permission_object> + p.auth.get_billable_size());
 
-      context.trx_context.add_ram_usage( update.account, new_size );
+      context.add_ram_usage( update.account, new_size );
    }
 }
 
@@ -282,7 +282,8 @@ void apply_eosio_deleteauth(apply_context& context) {
       const auto& index = db.get_index<permission_link_index, by_permission_name>();
       auto range = index.equal_range(boost::make_tuple(remove.account, remove.permission));
       EOS_ASSERT(range.first == range.second, action_validate_exception,
-                 "Cannot delete a linked authority. Unlink the authority first");
+                 "Cannot delete a linked authority. Unlink the authority first. This authority is linked to ${code}::${type}.", 
+                 ("code", string(range.first->code))("type", string(range.first->message_type)));
    }
 
    const auto& permission = authorization.get_permission({remove.account, remove.permission});
@@ -290,7 +291,7 @@ void apply_eosio_deleteauth(apply_context& context) {
 
    authorization.remove_permission( permission );
 
-   context.trx_context.add_ram_usage( remove.account, -old_size );
+   context.add_ram_usage( remove.account, -old_size );
 
 }
 
@@ -333,7 +334,7 @@ void apply_eosio_linkauth(apply_context& context) {
             link.required_permission = requirement.requirement;
          });
 
-         context.trx_context.add_ram_usage(
+         context.add_ram_usage(
             l.account,
             (int64_t)(config::billable_size_v<permission_link_object>)
          );
@@ -353,7 +354,7 @@ void apply_eosio_unlinkauth(apply_context& context) {
    auto link_key = boost::make_tuple(unlink.account, unlink.code, unlink.type);
    auto link = db.find<permission_link_object, by_action_name>(link_key);
    EOS_ASSERT(link != nullptr, action_validate_exception, "Attempting to unlink authority, but no link found");
-   context.trx_context.add_ram_usage(
+   context.add_ram_usage(
       link->account,
       -(int64_t)(config::billable_size_v<permission_link_object>)
    );

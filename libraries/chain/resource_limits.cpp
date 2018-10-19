@@ -3,9 +3,18 @@
 #include <eosio/chain/resource_limits_private.hpp>
 #include <eosio/chain/transaction_metadata.hpp>
 #include <eosio/chain/transaction.hpp>
+#include <boost/tuple/tuple_io.hpp>
+#include <eosio/chain/database_utils.hpp>
 #include <algorithm>
 
 namespace eosio { namespace chain { namespace resource_limits {
+
+using resource_index_set = index_set<
+   resource_limits_index,
+   resource_usage_index,
+   resource_limits_state_index,
+   resource_limits_config_index
+>;
 
 static_assert( config::rate_limiting_precision > 0, "config::rate_limiting_precision must be positive" );
 
@@ -22,9 +31,9 @@ static uint64_t update_elastic_limit(uint64_t current_limit, uint64_t average_us
 void elastic_limit_parameters::validate()const {
    // At the very least ensure parameters are not set to values that will cause divide by zero errors later on.
    // Stricter checks for sensible values can be added later.
-   FC_ASSERT( periods > 0, "elastic limit parameter 'periods' cannot be zero" );
-   FC_ASSERT( contract_rate.denominator > 0, "elastic limit parameter 'contract_rate' is not a well-defined ratio" );
-   FC_ASSERT( expand_rate.denominator > 0,   "elastic limit parameter 'expand_rate' is not a well-defined ratio" );
+   EOS_ASSERT( periods > 0, resource_limit_exception, "elastic limit parameter 'periods' cannot be zero" );
+   EOS_ASSERT( contract_rate.denominator > 0, resource_limit_exception, "elastic limit parameter 'contract_rate' is not a well-defined ratio" );
+   EOS_ASSERT( expand_rate.denominator > 0, resource_limit_exception, "elastic limit parameter 'expand_rate' is not a well-defined ratio" );
 }
 
 
@@ -39,10 +48,7 @@ void resource_limits_state_object::update_virtual_net_limit( const resource_limi
 }
 
 void resource_limits_manager::add_indices() {
-   _db.add_index<resource_limits_index>();
-   _db.add_index<resource_usage_index>();
-   _db.add_index<resource_limits_state_index>();
-   _db.add_index<resource_limits_config_index>();
+   resource_index_set::add_indices(_db);
 }
 
 void resource_limits_manager::initialize_database() {
@@ -56,6 +62,29 @@ void resource_limits_manager::initialize_database() {
       // start the chain off in a way that it is "congested" aka slow-start
       state.virtual_cpu_limit = config.cpu_limit_parameters.max;
       state.virtual_net_limit = config.net_limit_parameters.max;
+   });
+}
+
+void resource_limits_manager::add_to_snapshot( const snapshot_writer_ptr& snapshot ) const {
+   resource_index_set::walk_indices([this, &snapshot]( auto utils ){
+      snapshot->write_section<typename decltype(utils)::index_t::value_type>([this]( auto& section ){
+         decltype(utils)::walk(_db, [this, &section]( const auto &row ) {
+            section.add_row(row, _db);
+         });
+      });
+   });
+}
+
+void resource_limits_manager::read_from_snapshot( const snapshot_reader_ptr& snapshot ) {
+   resource_index_set::walk_indices([this, &snapshot]( auto utils ){
+      snapshot->read_section<typename decltype(utils)::index_t::value_type>([this]( auto& section ) {
+         bool more = !section.empty();
+         while(more) {
+            decltype(utils)::create(_db, [this, &section, &more]( auto &row ) {
+               more = section.read_row(row, _db);
+            });
+         }
+      });
    });
 }
 
@@ -334,12 +363,12 @@ uint64_t resource_limits_manager::get_block_net_limit() const {
    return config.net_limit_parameters.max - state.pending_net_usage;
 }
 
-int64_t resource_limits_manager::get_account_cpu_limit( const account_name& name ) const {
-   auto arl = get_account_cpu_limit_ex(name);
+int64_t resource_limits_manager::get_account_cpu_limit( const account_name& name, bool elastic ) const {
+   auto arl = get_account_cpu_limit_ex(name, elastic);
    return arl.available;
 }
 
-account_resource_limit resource_limits_manager::get_account_cpu_limit_ex( const account_name& name ) const {
+account_resource_limit resource_limits_manager::get_account_cpu_limit_ex( const account_name& name, bool elastic) const {
 
    const auto& state = _db.get<resource_limits_state_object>();
    const auto& usage = _db.get<resource_usage_object, by_owner>(name);
@@ -356,7 +385,7 @@ account_resource_limit resource_limits_manager::get_account_cpu_limit_ex( const 
 
    uint128_t window_size = config.account_cpu_usage_average_window;
 
-   uint128_t virtual_cpu_capacity_in_window = (uint128_t)state.virtual_cpu_limit * window_size;
+   uint128_t virtual_cpu_capacity_in_window = (uint128_t)(elastic ? state.virtual_cpu_limit : config.cpu_limit_parameters.max) * window_size;
    uint128_t user_weight     = (uint128_t)cpu_weight;
    uint128_t all_user_weight = (uint128_t)state.total_cpu_weight;
 
@@ -373,12 +402,12 @@ account_resource_limit resource_limits_manager::get_account_cpu_limit_ex( const 
    return arl;
 }
 
-int64_t resource_limits_manager::get_account_net_limit( const account_name& name ) const {
-   auto arl = get_account_net_limit_ex(name);
+int64_t resource_limits_manager::get_account_net_limit( const account_name& name, bool elastic) const {
+   auto arl = get_account_net_limit_ex(name, elastic);
    return arl.available;
 }
 
-account_resource_limit resource_limits_manager::get_account_net_limit_ex( const account_name& name ) const {
+account_resource_limit resource_limits_manager::get_account_net_limit_ex( const account_name& name, bool elastic) const {
    const auto& config = _db.get<resource_limits_config_object>();
    const auto& state  = _db.get<resource_limits_state_object>();
    const auto& usage  = _db.get<resource_usage_object, by_owner>(name);
@@ -394,7 +423,7 @@ account_resource_limit resource_limits_manager::get_account_net_limit_ex( const 
 
    uint128_t window_size = config.account_net_usage_average_window;
 
-   uint128_t virtual_network_capacity_in_window = state.virtual_net_limit * window_size;
+   uint128_t virtual_network_capacity_in_window = (uint128_t)(elastic ? state.virtual_net_limit : config.net_limit_parameters.max) * window_size;
    uint128_t user_weight     = (uint128_t)net_weight;
    uint128_t all_user_weight = (uint128_t)state.total_net_weight;
 
@@ -411,6 +440,5 @@ account_resource_limit resource_limits_manager::get_account_net_limit_ex( const 
    arl.max = impl::downgrade_cast<int64_t>(max_user_use_in_window);
    return arl;
 }
-
 
 } } } /// eosio::chain::resource_limits

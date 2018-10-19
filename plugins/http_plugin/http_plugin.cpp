@@ -3,6 +3,7 @@
  *  @copyright defined in eos/LICENSE.txt
  */
 #include <eosio/http_plugin/http_plugin.hpp>
+#include <eosio/http_plugin/local_endpoint.hpp>
 #include <eosio/chain/exceptions.hpp>
 
 #include <fc/network/ip.hpp>
@@ -23,6 +24,7 @@
 
 #include <thread>
 #include <memory>
+#include <regex>
 
 namespace eosio {
 
@@ -31,12 +33,22 @@ namespace eosio {
    namespace asio = boost::asio;
 
    using std::map;
+   using std::vector;
+   using std::set;
    using std::string;
+   using std::regex;
    using boost::optional;
    using boost::asio::ip::tcp;
+   using boost::asio::ip::address_v4;
+   using boost::asio::ip::address_v6;
    using std::shared_ptr;
    using websocketpp::connection_hdl;
 
+   static http_plugin_defaults current_http_plugin_defaults;
+
+   void http_plugin::set_defaults(const http_plugin_defaults config) {
+      current_http_plugin_defaults = config;
+   }
 
    namespace detail {
 
@@ -73,9 +85,42 @@ namespace eosio {
 
           static const long timeout_open_handshake = 0;
       };
+
+      struct asio_local_with_stub_log : public websocketpp::config::asio {
+          typedef asio_local_with_stub_log type;
+          typedef asio base;
+
+          typedef base::concurrency_type concurrency_type;
+
+          typedef base::request_type request_type;
+          typedef base::response_type response_type;
+
+          typedef base::message_type message_type;
+          typedef base::con_msg_manager_type con_msg_manager_type;
+          typedef base::endpoint_msg_manager_type endpoint_msg_manager_type;
+
+          typedef websocketpp::log::stub elog_type;
+          typedef websocketpp::log::stub alog_type;
+
+          typedef base::rng_type rng_type;
+
+          struct transport_config : public base::transport_config {
+              typedef type::concurrency_type concurrency_type;
+              typedef type::alog_type alog_type;
+              typedef type::elog_type elog_type;
+              typedef type::request_type request_type;
+              typedef type::response_type response_type;
+              typedef websocketpp::transport::asio::basic_socket::local_endpoint socket_type;
+          };
+
+          typedef websocketpp::transport::asio::local_endpoint<transport_config> transport_type;
+
+          static const long timeout_open_handshake = 0;
+      };
    }
 
    using websocket_server_type = websocketpp::server<detail::asio_with_stub_log<websocketpp::transport::asio::basic_socket::endpoint>>;
+   using websocket_local_server_type = websocketpp::server<detail::asio_local_with_stub_log>;
    using websocket_server_tls_type =  websocketpp::server<detail::asio_with_stub_log<websocketpp::transport::asio::tls_socket::endpoint>>;
    using ssl_context_ptr =  websocketpp::lib::shared_ptr<websocketpp::lib::asio::ssl::context>;
 
@@ -99,6 +144,35 @@ namespace eosio {
 
          websocket_server_tls_type https_server;
 
+         optional<asio::local::stream_protocol::endpoint> unix_endpoint;
+         websocket_local_server_type unix_server;
+
+         bool                     validate_host;
+         set<string>              valid_hosts;
+
+         string                   unix_socket_path_option_name     = "unix-socket-path";
+         string                   http_server_address_option_name  = "http-server-address";
+         string                   https_server_address_option_name = "https-server-address";
+
+         bool host_port_is_valid( const std::string& header_host_port, const string& endpoint_local_host_port ) {
+            return !validate_host || header_host_port == endpoint_local_host_port || valid_hosts.find(header_host_port) != valid_hosts.end();
+         }
+
+         bool host_is_valid( const std::string& host, const string& endpoint_local_host_port, bool secure) {
+            if (!validate_host) {
+               return true;
+            }
+
+            // normalise the incoming host so that it always has the explicit port
+            static auto has_port_expr = regex("[^:]:[0-9]+$"); /// ends in :<number> without a preceeding colon which implies ipv6
+            if (std::regex_search(host, has_port_expr)) {
+               return host_port_is_valid( host, endpoint_local_host_port );
+            } else {
+               // according to RFC 2732 ipv6 addresses should always be enclosed with brackets so we shouldn't need to special case here
+               return host_port_is_valid( host + ":" + std::to_string(secure ? websocketpp::uri_default_secure_port : websocketpp::uri_default_port ), endpoint_local_host_port);
+            }
+         }
+
          ssl_context_ptr on_tls_init(websocketpp::connection_hdl hdl) {
             ssl_context_ptr ctx = websocketpp::lib::make_shared<websocketpp::lib::asio::ssl::context>(asio::ssl::context::sslv23_server);
 
@@ -117,14 +191,14 @@ namespace eosio {
 
                fc::ec_key ecdh = EC_KEY_new_by_curve_name(NID_secp384r1);
                if (!ecdh)
-                  FC_THROW("Failed to set NID_secp384r1");
+                  EOS_THROW(chain::http_exception, "Failed to set NID_secp384r1");
                if(SSL_CTX_set_tmp_ecdh(ctx->native_handle(), (EC_KEY*)ecdh) != 1)
-                  FC_THROW("Failed to set ECDH PFS");
+                  EOS_THROW(chain::http_exception, "Failed to set ECDH PFS");
 
                if(SSL_CTX_set_cipher_list(ctx->native_handle(), \
                   "EECDH+ECDSA+AESGCM:EECDH+aRSA+AESGCM:EECDH+ECDSA+SHA384:EECDH+ECDSA+SHA256:AES256:" \
                   "!DHE:!RSA:!AES128:!RC4:!DES:!3DES:!DSS:!SRP:!PSK:!EXP:!MD5:!LOW:!aNULL:!eNULL") != 1)
-                  FC_THROW("Failed to set HTTPS cipher list");
+                  EOS_THROW(chain::http_exception, "Failed to set HTTPS cipher list");
             } catch (const fc::exception& e) {
                elog("https server initialization error: ${w}", ("w", e.to_detail_string()));
             } catch(std::exception& e) {
@@ -135,7 +209,7 @@ namespace eosio {
          }
 
          template<class T>
-         static void handle_exception(typename websocketpp::server<detail::asio_with_stub_log<T>>::connection_ptr con) {
+         static void handle_exception(typename websocketpp::server<T>::connection_ptr con) {
             string err = "Internal Service error, http: ";
             try {
                con->set_status( websocketpp::http::status_code::internal_server_error );
@@ -167,8 +241,27 @@ namespace eosio {
          }
 
          template<class T>
-         void handle_http_request(typename websocketpp::server<detail::asio_with_stub_log<T>>::connection_ptr con) {
+         bool allow_host(const typename T::request_type& req, typename websocketpp::server<T>::connection_ptr con) {
+            bool is_secure = con->get_uri()->get_secure();
+            const auto& local_endpoint = con->get_socket().lowest_layer().local_endpoint();
+            auto local_socket_host_port = local_endpoint.address().to_string() + ":" + std::to_string(local_endpoint.port());
+
+            const auto& host_str = req.get_header("Host");
+            if (host_str.empty() || !host_is_valid(host_str, local_socket_host_port, is_secure)) {
+               con->set_status(websocketpp::http::status_code::bad_request);
+               return false;
+            }
+            return true;
+         }
+
+         template<class T>
+         void handle_http_request(typename websocketpp::server<T>::connection_ptr con) {
             try {
+               auto& req = con->get_request();
+
+               if(!allow_host<T>(req, con))
+                  return;
+
                if( !access_control_allow_origin.empty()) {
                   con->append_header( "Access-Control-Allow-Origin", access_control_allow_origin );
                }
@@ -181,8 +274,7 @@ namespace eosio {
                if( access_control_allow_credentials ) {
                   con->append_header( "Access-Control-Allow-Credentials", "true" );
                }
-               
-               auto& req = con->get_request();
+
                if(req.get_method() == "OPTIONS") {
                   con->set_status(websocketpp::http::status_code::ok);
                   return;
@@ -201,7 +293,7 @@ namespace eosio {
                   } );
 
                } else {
-                  wlog( "404 - not found: ${ep}", ("ep", resource));
+                  dlog( "404 - not found: ${ep}", ("ep", resource));
                   error_results results{websocketpp::http::status_code::not_found,
                                         "Not Found", error_results::error_info(fc::exception( FC_LOG_MESSAGE( error, "Unknown Endpoint" )), verbose_http_errors )};
                   con->set_body( fc::json::to_string( results ));
@@ -220,7 +312,7 @@ namespace eosio {
                ws.set_reuse_addr(true);
                ws.set_max_http_body_size(max_body_size);
                ws.set_http_handler([&](connection_hdl hdl) {
-                  handle_http_request<T>(ws.get_con_from_hdl(hdl));
+                  handle_http_request<detail::asio_with_stub_log<T>>(ws.get_con_from_hdl(hdl));
                });
             } catch ( const fc::exception& e ){
                elog( "http: ${e}", ("e",e.to_detail_string()));
@@ -230,17 +322,48 @@ namespace eosio {
                elog("error thrown from http io service");
             }
          }
+
+         void add_aliases_for_endpoint( const tcp::endpoint& ep, string host, string port ) {
+            auto resolved_port_str = std::to_string(ep.port());
+            valid_hosts.emplace(host + ":" + port);
+            valid_hosts.emplace(host + ":" + resolved_port_str);
+         }
+
+         void mangle_option_names() {
+            if(current_http_plugin_defaults.address_config_prefix.empty())
+               return;
+            unix_socket_path_option_name.insert(0, current_http_plugin_defaults.address_config_prefix+"-");
+            http_server_address_option_name.insert(0, current_http_plugin_defaults.address_config_prefix+"-");
+            https_server_address_option_name.insert(0, current_http_plugin_defaults.address_config_prefix+"-");
+         }
    };
+
+   template<>
+   bool http_plugin_impl::allow_host<detail::asio_local_with_stub_log>(const detail::asio_local_with_stub_log::request_type& req, websocketpp::server<detail::asio_local_with_stub_log>::connection_ptr con) {
+      return true;
+   }
 
    http_plugin::http_plugin():my(new http_plugin_impl()){}
    http_plugin::~http_plugin(){}
 
    void http_plugin::set_program_options(options_description&, options_description& cfg) {
-      cfg.add_options()
-            ("http-server-address", bpo::value<string>()->default_value("127.0.0.1:8888"),
-             "The local IP and port to listen for incoming http connections; set blank to disable.")
+      my->mangle_option_names();
+      if(current_http_plugin_defaults.default_unix_socket_path.length())
+         cfg.add_options()
+            (my->unix_socket_path_option_name.c_str(), bpo::value<string>()->default_value(current_http_plugin_defaults.default_unix_socket_path),
+             "The filename (relative to data-dir) to create a unix socket for HTTP RPC; set blank to disable.");
 
-            ("https-server-address", bpo::value<string>(),
+      if(current_http_plugin_defaults.default_http_port)
+         cfg.add_options()
+            (my->http_server_address_option_name.c_str(), bpo::value<string>()->default_value("127.0.0.1:" + std::to_string(current_http_plugin_defaults.default_http_port)),
+             "The local IP and port to listen for incoming http connections; set blank to disable.");
+      else
+         cfg.add_options()
+            (my->http_server_address_option_name.c_str(), bpo::value<string>(),
+             "The local IP and port to listen for incoming http connections; leave blank to disable.");
+
+      cfg.add_options()
+            (my->https_server_address_option_name.c_str(), bpo::value<string>(),
              "The local IP and port to listen for incoming https connections; leave blank to disable.")
 
             ("https-certificate-chain-file", bpo::value<string>(),
@@ -275,52 +398,84 @@ namespace eosio {
              "Specify if Access-Control-Allow-Credentials: true should be returned on each request.")
             ("max-body-size", bpo::value<uint32_t>()->default_value(1024*1024), "The maximum body size in bytes allowed for incoming RPC requests")
             ("verbose-http-errors", bpo::bool_switch()->default_value(false), "Append the error log to HTTP responses")
+            ("http-validate-host", boost::program_options::value<bool>()->default_value(true), "If set to false, then any incoming \"Host\" header is considered valid")
+            ("http-alias", bpo::value<std::vector<string>>()->composing(), "Additionaly acceptable values for the \"Host\" header of incoming HTTP requests, can be specified multiple times.  Includes http/s_server_address by default.")
             ;
    }
 
    void http_plugin::plugin_initialize(const variables_map& options) {
-      tcp::resolver resolver(app().get_io_service());
-      if(options.count("http-server-address") && options.at("http-server-address").as<string>().length()) {
-         string lipstr =  options.at("http-server-address").as<string>();
-         string host = lipstr.substr(0, lipstr.find(':'));
-         string port = lipstr.substr(host.size()+1, lipstr.size());
-         tcp::resolver::query query( tcp::v4(), host.c_str(), port.c_str() );
-         try {
-            my->listen_endpoint = *resolver.resolve(query);
-            ilog("configured http to listen on ${h}:${p}", ("h",host)("p",port));
-         } catch(const boost::system::system_error& ec) {
-            elog("failed to configure http to listen on ${h}:${p} (${m})", ("h",host)("p",port)("m", ec.what()));
-         }
-      }
-
-      if(options.count("https-server-address") && options.at("https-server-address").as<string>().length()) {
-         if(!options.count("https-certificate-chain-file") || options.at("https-certificate-chain-file").as<string>().empty()) {
-            elog("https-certificate-chain-file is required for HTTPS");
-            return;
-         }
-         if(!options.count("https-private-key-file") || options.at("https-private-key-file").as<string>().empty()) {
-            elog("https-private-key-file is required for HTTPS");
-            return;
+      try {
+         my->validate_host = options.at("http-validate-host").as<bool>();
+         if( options.count( "http-alias" )) {
+            const auto& aliases = options["http-alias"].as<vector<string>>();
+            my->valid_hosts.insert(aliases.begin(), aliases.end());
          }
 
-         string lipstr =  options.at("https-server-address").as<string>();
-         string host = lipstr.substr(0, lipstr.find(':'));
-         string port = lipstr.substr(host.size()+1, lipstr.size());
-         tcp::resolver::query query(tcp::v4(), host.c_str(), port.c_str());
-         try {
-            my->https_listen_endpoint = *resolver.resolve(query);
-            ilog("configured https to listen on ${h}:${p} (TLS configuration will be validated momentarily)", ("h",host)("p",port));
-            my->https_cert_chain = options.at("https-certificate-chain-file").as<string>();
-            my->https_key = options.at("https-private-key-file").as<string>();
-         } catch(const boost::system::system_error& ec) {
-            elog("failed to configure https to listen on ${h}:${p} (${m})", ("h",host)("p",port)("m", ec.what()));
+         tcp::resolver resolver( app().get_io_service());
+         if( options.count( my->http_server_address_option_name ) && options.at( my->http_server_address_option_name ).as<string>().length()) {
+            string lipstr = options.at( my->http_server_address_option_name ).as<string>();
+            string host = lipstr.substr( 0, lipstr.find( ':' ));
+            string port = lipstr.substr( host.size() + 1, lipstr.size());
+            tcp::resolver::query query( tcp::v4(), host.c_str(), port.c_str());
+            try {
+               my->listen_endpoint = *resolver.resolve( query );
+               ilog( "configured http to listen on ${h}:${p}", ("h", host)( "p", port ));
+            } catch ( const boost::system::system_error& ec ) {
+               elog( "failed to configure http to listen on ${h}:${p} (${m})",
+                     ("h", host)( "p", port )( "m", ec.what()));
+            }
+
+            // add in resolved hosts and ports as well
+            if (my->listen_endpoint) {
+               my->add_aliases_for_endpoint(*my->listen_endpoint, host, port);
+            }
          }
-      }
 
-      my->max_body_size = options.at("max-body-size").as<uint32_t>();
-      verbose_http_errors = options.at("verbose-http-errors").as<bool>();
+         if( options.count( my->unix_socket_path_option_name ) && !options.at( my->unix_socket_path_option_name ).as<string>().empty()) {
+            boost::filesystem::path sock_path = options.at(my->unix_socket_path_option_name).as<string>();
+            if (sock_path.is_relative())
+               sock_path = app().data_dir() / sock_path;
+            my->unix_endpoint = asio::local::stream_protocol::endpoint(sock_path.string());
+         }
 
-      //watch out for the returns above when adding new code here
+         if( options.count( my->https_server_address_option_name ) && options.at( my->https_server_address_option_name ).as<string>().length()) {
+            if( !options.count( "https-certificate-chain-file" ) ||
+                options.at( "https-certificate-chain-file" ).as<string>().empty()) {
+               elog( "https-certificate-chain-file is required for HTTPS" );
+               return;
+            }
+            if( !options.count( "https-private-key-file" ) ||
+                options.at( "https-private-key-file" ).as<string>().empty()) {
+               elog( "https-private-key-file is required for HTTPS" );
+               return;
+            }
+
+            string lipstr = options.at( my->https_server_address_option_name ).as<string>();
+            string host = lipstr.substr( 0, lipstr.find( ':' ));
+            string port = lipstr.substr( host.size() + 1, lipstr.size());
+            tcp::resolver::query query( tcp::v4(), host.c_str(), port.c_str());
+            try {
+               my->https_listen_endpoint = *resolver.resolve( query );
+               ilog( "configured https to listen on ${h}:${p} (TLS configuration will be validated momentarily)",
+                     ("h", host)( "p", port ));
+               my->https_cert_chain = options.at( "https-certificate-chain-file" ).as<string>();
+               my->https_key = options.at( "https-private-key-file" ).as<string>();
+            } catch ( const boost::system::system_error& ec ) {
+               elog( "failed to configure https to listen on ${h}:${p} (${m})",
+                     ("h", host)( "p", port )( "m", ec.what()));
+            }
+
+            // add in resolved hosts and ports as well
+            if (my->https_listen_endpoint) {
+               my->add_aliases_for_endpoint(*my->https_listen_endpoint, host, port);
+            }
+         }
+
+         my->max_body_size = options.at( "max-body-size" ).as<uint32_t>();
+         verbose_http_errors = options.at( "verbose-http-errors" ).as<bool>();
+
+         //watch out for the returns above when adding new code here
+      } FC_LOG_AND_RETHROW()
    }
 
    void http_plugin::plugin_startup() {
@@ -339,6 +494,28 @@ namespace eosio {
             throw;
          } catch (...) {
             elog("error thrown from http io service");
+            throw;
+         }
+      }
+
+      if(my->unix_endpoint) {
+         try {
+            my->unix_server.clear_access_channels(websocketpp::log::alevel::all);
+            my->unix_server.init_asio(&app().get_io_service());
+            my->unix_server.set_max_http_body_size(my->max_body_size);
+            my->unix_server.listen(*my->unix_endpoint);
+            my->unix_server.set_http_handler([&](connection_hdl hdl) {
+               my->handle_http_request<detail::asio_local_with_stub_log>( my->unix_server.get_con_from_hdl(hdl));
+            });
+            my->unix_server.start_accept();
+         } catch ( const fc::exception& e ){
+            elog( "unix socket service failed to start: ${e}", ("e",e.to_detail_string()));
+            throw;
+         } catch ( const std::exception& e ){
+            elog( "unix socket service failed to start: ${e}", ("e",e.what()));
+            throw;
+         } catch (...) {
+            elog("error thrown from unix socket io service");
             throw;
          }
       }
@@ -390,20 +567,19 @@ namespace eosio {
          } catch (chain::tx_duplicate& e) {
             error_results results{409, "Conflict", error_results::error_info(e, verbose_http_errors)};
             cb( 409, fc::json::to_string( results ));
-         } catch (chain::transaction_exception& e) {
-            error_results results{400, "Bad Request", error_results::error_info(e, verbose_http_errors)};
-            cb( 400, fc::json::to_string( results ));
          } catch (fc::eof_exception& e) {
-            error_results results{400, "Bad Request", error_results::error_info(e, verbose_http_errors)};
-            cb( 400, fc::json::to_string( results ));
+            error_results results{422, "Unprocessable Entity", error_results::error_info(e, verbose_http_errors)};
+            cb( 422, fc::json::to_string( results ));
             elog( "Unable to parse arguments to ${api}.${call}", ("api", api_name)( "call", call_name ));
             dlog("Bad arguments: ${args}", ("args", body));
          } catch (fc::exception& e) {
             error_results results{500, "Internal Service Error", error_results::error_info(e, verbose_http_errors)};
             cb( 500, fc::json::to_string( results ));
-            elog( "FC Exception encountered while processing ${api}.${call}",
-                  ("api", api_name)( "call", call_name ));
-            dlog( "Exception Details: ${e}", ("e", e.to_detail_string()));
+            if (e.code() != chain::greylist_net_usage_exceeded::code_value && e.code() != chain::greylist_cpu_usage_exceeded::code_value) {
+               elog( "FC Exception encountered while processing ${api}.${call}",
+                     ("api", api_name)( "call", call_name ));
+               dlog( "Exception Details: ${e}", ("e", e.to_detail_string()));
+            }
          } catch (std::exception& e) {
             error_results results{500, "Internal Service Error", error_results::error_info(fc::exception( FC_LOG_MESSAGE( error, e.what())), verbose_http_errors)};
             cb( 500, fc::json::to_string( results ));
@@ -428,6 +604,10 @@ namespace eosio {
 
    bool http_plugin::is_secure() const {
       return (!my->listen_endpoint || my->listen_endpoint->address().is_loopback());
+   }
+
+   bool http_plugin::verbose_errors()const {
+      return verbose_http_errors;
    }
 
 }
